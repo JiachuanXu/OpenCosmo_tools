@@ -99,6 +99,7 @@ def _log(rank, msg):
 def mask_bad_halocat(
     data,
     fill_value=None,
+    max_axis_mag=20.0,
     halo_axis_keys=(
         "top_host_infall_fof_halo_eigS3X",
         "top_host_infall_fof_halo_eigS3Y",
@@ -107,19 +108,17 @@ def mask_bad_halocat(
     atol=1e-8,
 ):
     """Return True for galaxies with missing or fill-value host halo major axis."""
-    bad = (
-        np.isclose(_val(data[halo_axis_keys[0]]), 0, atol=atol)
-        | np.isclose(_val(data[halo_axis_keys[1]]), 0, atol=atol)
-        | np.isclose(_val(data[halo_axis_keys[2]]), 0, atol=atol)
-        | (np.abs(_val(data[halo_axis_keys[0]])) > 100.0)
-        | (np.abs(_val(data[halo_axis_keys[1]])) > 100.0)
-        | (np.abs(_val(data[halo_axis_keys[2]])) > 100.0)
+    halo_axis_mag = np.sqrt(
+        _val(data[halo_axis_keys[0]])**2 +
+        _val(data[halo_axis_keys[1]])**2 +
+        _val(data[halo_axis_keys[2]])**2
     )
+    bad = np.isclose(halo_axis_mag, 0, atol=atol) | (halo_axis_mag > max_axis_mag)
     if fill_value is not None:
         bad |= (
             np.isclose(_val(data[halo_axis_keys[0]]), fill_value, atol=atol)
-            | np.isclose(_val(data[halo_axis_keys[1]]), fill_value, atol=atol)
-            | np.isclose(_val(data[halo_axis_keys[2]]), fill_value, atol=atol)
+            & np.isclose(_val(data[halo_axis_keys[1]]), fill_value, atol=atol)
+            & np.isclose(_val(data[halo_axis_keys[2]]), fill_value, atol=atol)
         )
     return bad
 
@@ -337,6 +336,14 @@ def combine_ia_results(result_good, result_bad, good_mask, bad_mask, n_total):
 
 # ─── Output ───────────────────────────────────────────────────────────────────
 
+def _cast_col(arr):
+    """Cast float arrays to float32; leave bool and integer dtypes unchanged."""
+    a = np.asarray(arr)
+    if np.issubdtype(a.dtype, np.floating):
+        return a.astype(np.float32)
+    return a
+
+
 def save_catalog(data, synthetic_flag, valid_halo_flag, galaxy_axes, E2D_disk, E2D_bulge, output_path):
     """Write the IA-injected WL catalog to HDF5."""
     try:
@@ -349,7 +356,7 @@ def save_catalog(data, synthetic_flag, valid_halo_flag, galaxy_axes, E2D_disk, E
 
         for col in colnames:
             try:
-                grp.create_dataset(col, data=_val(data[col]))
+                grp.create_dataset(col, data=_cast_col(_val(data[col])))
             except Exception as e:
                 warnings.warn(f"Could not save column '{col}': {e}")
 
@@ -357,11 +364,11 @@ def save_catalog(data, synthetic_flag, valid_halo_flag, galaxy_axes, E2D_disk, E
         grp.create_dataset("valid_host_halo_shape", data=valid_halo_flag.astype(bool))
 
         for col, arr in galaxy_axes.items():
-            grp.create_dataset(col, data=arr)
+            grp.create_dataset(col, data=_cast_col(arr))
 
         for field in Ellipse2DParams._fields:
-            grp.create_dataset(f"disk_2d_{field}",  data=np.asarray(getattr(E2D_disk,  field)))
-            grp.create_dataset(f"bulge_2d_{field}", data=np.asarray(getattr(E2D_bulge, field)))
+            grp.create_dataset(f"disk_2d_{field}",  data=_cast_col(getattr(E2D_disk,  field)))
+            grp.create_dataset(f"bulge_2d_{field}", data=_cast_col(getattr(E2D_bulge, field)))
 
 
 # ─── Sanity figures ───────────────────────────────────────────────────────────
