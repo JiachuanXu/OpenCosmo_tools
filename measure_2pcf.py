@@ -8,6 +8,7 @@ IA-injected galaxy catalogs produced by inject_ia.py.
 Usage
 -----
     python measure_2pcf.py --input_dir /path/to/catalogs \\
+        --data_dir /path/to/lc_cores_files \\
         --output_dir /path/to/output \\
         --z_min 0.5 --z_max 1.0 \\
         [--num_threads 8] [--patch_threshold 500000] [--n_patches 50]
@@ -46,7 +47,7 @@ from pathlib import Path
 import numpy as np
 import h5py
 import treecorr
-from astropy.cosmology import FlatLambdaCDM
+import opencosmo as oc
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
@@ -54,6 +55,28 @@ sys.path.insert(0, os.path.join(_SCRIPT_DIR, "modular_alignments"))
 from ellipse_proj_kernels_v2 import compute_ellipse2d
 
 from random_catalog import make_random_catalog
+
+
+# ── cosmology ─────────────────────────────────────────────────────────────────
+
+def load_cosmology(data_dir):
+    """
+    Read the fiducial cosmology from the original diffsky lc_cores*.hdf5 files.
+
+    The cosmology is stored as metadata in the opencosmo dataset and is
+    retrieved via ``dataset.cosmology``, which returns an astropy cosmology
+    object.  This mirrors how inject_ia.py accesses it via
+    ``dataset.cosmology.comoving_distance(...)``.
+    """
+    files = sorted(Path(data_dir).glob("lc_cores*.hdf5"))
+    if not files:
+        raise FileNotFoundError(
+            f"No lc_cores*.hdf5 files found in {data_dir}. "
+            "Pass the directory of the original diffsky mock via --data_dir."
+        )
+    cosmo = oc.open(files[0]).cosmology
+    print(f"Cosmology loaded from {files[0].name}: {cosmo}")
+    return cosmo
 
 
 # ── filename parsing ──────────────────────────────────────────────────────────
@@ -240,12 +263,46 @@ def build_patch_centers(ra_deg, dec_deg, r_mpc, npatch):
 
 # ── treecorr measurement helpers ─────────────────────────────────────────────
 
+def _validate_bin_slop(bin_slop, min_sep, max_sep, nbins):
+    """
+    Validate bin_slop against its documented valid range and accuracy threshold.
+
+    bin_slop controls how much a pair's separation is allowed to differ from
+    the true bin edge before it is assigned to an adjacent bin.  Concretely,
+    the tolerance distance is  b = bin_size * bin_slop  where
+    bin_size = log(max_sep / min_sep) / nbins  (in log-space).
+
+    Valid range  : bin_slop >= 0.  Negative values are rejected here because
+                   TreeCorr would silently treat them as a request for its
+                   internal auto-default, which hides user intent.
+    Accuracy note: TreeCorr emits its own warning when bin_slop exceeds
+                   max_good_slop ~ 0.1 / bin_size.  As a rule of thumb,
+                   values above 1.0 risk significant inaccuracies.
+    """
+    if bin_slop < 0.0:
+        raise ValueError(
+            f"bin_slop must be >= 0.0, got {bin_slop:.4g}.  "
+            "Negative values would trigger TreeCorr's internal auto-default, "
+            "masking the true bin_slop in use.  Pass 0.0 for exact computation "
+            "or a positive value for the desired tolerance fraction."
+        )
+    import math
+    bin_size = math.log(max_sep / min_sep) / nbins   # log-space bin width
+    max_good_slop = 0.1 / bin_size
+    if bin_slop > max_good_slop:
+        print(
+            f"[warn] bin_slop={bin_slop:.4g} exceeds max_good_slop={max_good_slop:.4g} "
+            f"(= 0.1 / bin_size where bin_size={bin_size:.4g}).  "
+            "TreeCorr may produce significant inaccuracies at this setting."
+        )
+
+
 def _treecorr_cfg(args):
     return dict(
         min_sep=args.min_sep,
         max_sep=args.max_sep,
         nbins=args.nbins,
-        bin_slop=0.0,
+        bin_slop=args.bin_slop,
         metric="Rperp",
         min_rpar=-100.0,
         max_rpar=100.0,
@@ -295,17 +352,15 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input_dir",  required=True,
                    help="Directory containing catalog_z*.hdf5 files from inject_ia.py")
+    p.add_argument("--data_dir",   required=True,
+                   help="Directory containing the original lc_cores*.hdf5 diffsky mock files "
+                        "(used to read the fiducial cosmology)")
     p.add_argument("--output_dir", required=True,
                    help="Directory for output correlation function text files")
     p.add_argument("--z_min", type=float, default=0.0,
                    help="Minimum redshift of galaxies to include (default 0.0)")
     p.add_argument("--z_max", type=float, default=3.0,
                    help="Maximum redshift of galaxies to include (default 3.0)")
-    # Cosmology
-    p.add_argument("--h",   type=float, default=0.677,
-                   help="Hubble parameter h = H0/100 (default 0.677)")
-    p.add_argument("--Om0", type=float, default=0.307,
-                   help="Matter density Ω_m (default 0.307)")
     # TreeCorr binning
     p.add_argument("--min_sep", type=float, default=0.1,
                    help="Minimum projected separation [Mpc] (default 0.1)")
@@ -313,6 +368,11 @@ def parse_args():
                    help="Maximum projected separation [Mpc] (default 120.0)")
     p.add_argument("--nbins",   type=int,   default=20,
                    help="Number of log-spaced r_p bins (default 20)")
+    p.add_argument("--bin_slop", type=float, default=0.0,
+                   help="TreeCorr bin_slop: fraction of a bin width by which pair separations "
+                        "may be misassigned to adjacent bins.  0 = exact (slowest); larger "
+                        "values trade accuracy for speed.  Must be >= 0; values above 1.0 "
+                        "risk significant inaccuracies and trigger a warning.  (default 0.0)")
     # Performance
     p.add_argument("--shape", choices=["disk", "bulge"], default="disk",
                    help="Galaxy shape component to use for 2PCF: disk or bulge (default disk)")
@@ -329,10 +389,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    _validate_bin_slop(args.bin_slop, args.min_sep, args.max_sep, args.nbins)
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cosmo = FlatLambdaCDM(H0=args.h * 100.0, Om0=args.Om0)
+    cosmo = load_cosmology(args.data_dir)
 
     # ── Load catalog ──────────────────────────────────────────────────────────
     print(f"\nLoading catalog from {args.input_dir}  z=[{args.z_min:.3f}, {args.z_max:.3f})")
